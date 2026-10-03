@@ -7,6 +7,7 @@ from dataclasses import asdict, dataclass, field, fields
 import os
 from pathlib import Path
 import sys
+import subprocess
 import tempfile
 
 import yaml
@@ -89,6 +90,10 @@ class Editor:
         self.message = ""
         self.saved = asdict(job)
         self.confirm_quit = False
+        self.build_requested = False
+        self.pr_lookup_requested = False
+        self.pr_choices = []
+        self.pr_index = 0
 
     def toggle(self, name, index):
         self.choice[name] = index
@@ -101,6 +106,18 @@ class Editor:
         setattr(self.job, name, [v for v in OPTIONS[name] if v in selected])
 
     def handle(self, key):
+        if self.pr_choices:
+            if key in ("\x1b", "\x11"):
+                self.pr_choices = []
+                self.message = "PR selection cancelled; tag unchanged."
+            elif key in (curses.KEY_DOWN, "\t"):
+                self.pr_index = (self.pr_index + 1) % len(self.pr_choices)
+            elif key in (curses.KEY_UP, curses.KEY_BTAB):
+                self.pr_index = (self.pr_index - 1) % len(self.pr_choices)
+            elif key in ("\n", "\r", curses.KEY_ENTER):
+                self.use_pr(self.pr_choices[self.pr_index])
+                self.pr_choices = []
+            return True
         if key in ("\x1b", "\x11"):
             if asdict(self.job) == self.saved or self.confirm_quit:
                 return False
@@ -108,10 +125,17 @@ class Editor:
             self.message = "Unsaved changes: Esc again to discard; any other key to continue."
             return True
         self.confirm_quit = False
-        if key in (curses.KEY_DOWN, "\t"):
-            self.active = (self.active + 1) % 7
+        if self.active == 1 and key == curses.KEY_F1:
+            self.fill_tag_from_revision()
+        elif self.active == 1 and key == curses.KEY_F2:
+            self.pr_lookup_requested = True
+        elif key in (curses.KEY_DOWN, "\t"):
+            self.active = (self.active + 1) % 8
         elif key in (curses.KEY_UP, curses.KEY_BTAB):
-            self.active = (self.active - 1) % 7
+            self.active = (self.active - 1) % 8
+        elif self.active == 7:
+            if key in ("\n", "\r", curses.KEY_ENTER, " "):
+                self.build_requested = True
         elif self.active == 6:
             if key in ("\n", "\r", curses.KEY_ENTER, " "):
                 try:
@@ -153,6 +177,89 @@ class Editor:
                 self.cursor[name] = pos
         return True
 
+    def use_pr(self, pr):
+        self.job.tag = f"pr-{pr['number']}"
+        self.cursor["tag"] = len(self.job.tag)
+        self.message = f"Selected Bluefin PR #{pr['number']}"
+
+    def find_prs(self, screen):
+        from github_prs import open_pull_requests
+
+        self.pr_lookup_requested = False
+        self.message = "Looking up open Bluefin PRs on GitHub..."
+        self.draw(screen)
+        try:
+            matches = open_pull_requests(self.job.git_rev)
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            detail = error.stderr.strip() if isinstance(error, subprocess.CalledProcessError) and error.stderr else str(error)
+            self.message = f"Tag unchanged: {detail}"
+            return
+        if not matches:
+            self.message = "No associated open Bluefin PR found; tag unchanged."
+        elif len(matches) == 1:
+            self.use_pr(matches[0])
+        else:
+            self.pr_choices = matches
+            self.pr_index = 0
+            self.message = "Choose an open PR to use for the tag."
+
+    def fill_tag_from_revision(self):
+        repo = Path(os.environ.get("BLUEFIN_REPO") or
+                    Path(__file__).resolve().parent.parent / "bluefin").resolve()
+        try:
+            result = subprocess.run(
+                ["git", "-C", str(repo), "rev-parse", "--short", "--verify",
+                 "--end-of-options", f"{self.job.git_rev}^{{commit}}"],
+                check=True, capture_output=True, text=True,
+            )
+            tag = result.stdout.strip()
+            if not tag:
+                raise ValueError("Git returned an empty revision")
+        except (OSError, ValueError, subprocess.CalledProcessError) as error:
+            detail = error.stderr.strip() if isinstance(error, subprocess.CalledProcessError) and error.stderr else str(error)
+            self.message = f"Tag unchanged: {detail}"
+            return
+        self.job.tag = tag
+        self.cursor["tag"] = len(tag)
+        self.message = f"Tag filled from {self.job.git_rev}: {tag}"
+
+    def build(self, screen):
+        from build import plan_job
+
+        self.build_requested = False
+        try:
+            plan_job(self.job)
+            save_job(self.job, self.path)
+            self.saved = asdict(self.job)
+        except (OSError, ValueError) as error:
+            self.message = f"Build failed: {error}"
+            return
+        curses.def_prog_mode()
+        curses.endwin()
+        try:
+            print("Building and pushing the saved job...", flush=True)
+            result = subprocess.run([sys.executable, str(Path(__file__).with_name("build.py")),
+                                     "--config", str(self.path.resolve())])
+            self.message = ("Build and push completed." if result.returncode == 0 else
+                            f"Build and push failed (exit {result.returncode}); see terminal output.")
+        except OSError as error:
+            self.message = f"Build failed: {error}"
+        except KeyboardInterrupt:
+            self.message = "Build interrupted; checkout retained."
+        finally:
+            print(self.message, flush=True)
+            try:
+                input("Press Enter to return to the editor...")
+            except (EOFError, KeyboardInterrupt):
+                pass
+            curses.reset_prog_mode()
+            screen.keypad(True)
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
+            screen.clearok(True)
+
     def draw(self, screen):
         height, width = screen.getmaxyx()
         screen.erase()
@@ -164,7 +271,7 @@ class Editor:
             screen.refresh()
             return
         pad_width = max(width, 160)
-        pad = curses.newpad(17, pad_width)
+        pad = curses.newpad(19, pad_width)
         dirty = " *" if asdict(self.job) != self.saved else ""
         pad.addstr(0, 0, "Bluefin build job" + dirty, curses.A_BOLD)
         selected_column = 0
@@ -184,28 +291,59 @@ class Editor:
             else:
                 value = getattr(self.job, name)
                 available = max(1, width - x - 2)
+                hint = "[F1: short rev] [F2: PR]" if width >= 52 else "F1/F2"
+                if name == "tag":
+                    available = max(1, available - len(hint) - 1)
                 pos = self.cursor[name]
                 start = max(0, pos - available + 1) if active else 0
                 text = value[start:start + available].ljust(available)
                 pad.addstr(y, x, text, curses.A_REVERSE if active else curses.A_NORMAL)
                 if active:
                     pad.chgat(y, x + pos - start, 1, curses.A_REVERSE | curses.A_BOLD | curses.A_UNDERLINE)
+                if name == "tag":
+                    pad.addstr(y, x + available + 1, hint, curses.A_BOLD if active else curses.A_NORMAL)
         pad.addstr(14, 0, "> " if self.active == 6 else "  ")
         pad.addstr(14, 16, "[ Save bluefin-build.yml ]", curses.A_REVERSE if self.active == 6 else curses.A_BOLD)
-        view_height = min(17, height - 3)
+        pad.addstr(16, 0, "> " if self.active == 7 else "  ")
+        pad.addstr(16, 16, "[ Build and push ]", curses.A_REVERSE if self.active == 7 else curses.A_BOLD)
+        view_height = min(19, height - 3)
         active_y = 2 + self.active * 2
         self.offset = min(self.offset, active_y)
         self.offset = max(self.offset, active_y - view_height + 1)
-        self.offset = min(self.offset, 17 - view_height)
+        self.offset = min(self.offset, 19 - view_height)
         left = max(0, selected_column - width + 2)
         screen.noutrefresh()
         pad.noutrefresh(self.offset, left, 0, 0, view_height - 1, width - 1)
         for y, text in ((height - 3, "Up/Down: field  Left/Right: move  Space/1-4: toggle"),
-                        (height - 2, "Enter/Space: save button  Ctrl-U: clear text  Esc: quit"),
+                        (height - 2, "Enter/Space: activate button  Ctrl-U: clear  Esc: quit"),
                         (height - 1, self.message)):
             screen.addnstr(y, 0, text, width - 1)
         screen.noutrefresh()
+        if self.pr_choices:
+            self.draw_pr_chooser(screen)
         curses.doupdate()
+
+    def draw_pr_chooser(self, screen):
+        height, width = screen.getmaxyx()
+        modal_height = min(height, len(self.pr_choices) + 5)
+        modal_width = min(width, 80)
+        modal = curses.newwin(modal_height, modal_width,
+                              (height - modal_height) // 2, (width - modal_width) // 2)
+        modal.erase()
+        modal.box()
+        modal.addnstr(1, 2, "Choose a pull request", modal_width - 4, curses.A_BOLD)
+        visible = modal_height - 4
+        first = max(0, min(self.pr_index - visible + 1, len(self.pr_choices) - visible))
+        for row, pr in enumerate(self.pr_choices[first:first + visible]):
+            selected = first + row == self.pr_index
+            # Keep remote titles within the modal even when they contain wide glyphs.
+            text = f"{'>' if selected else ' '} #{pr['number']} {pr['title']}"
+            text = text.encode("ascii", "replace").decode("ascii")
+            modal.addnstr(row + 2, 2, text, modal_width - 4,
+                          curses.A_REVERSE if selected else curses.A_NORMAL)
+        help_text = "Up/Down  Enter: use  Esc: cancel" if modal_width >= 36 else "Up/Down Enter Esc"
+        modal.addnstr(modal_height - 2, 2, help_text, modal_width - 4)
+        modal.noutrefresh()
 
     def run(self, screen):
         screen.keypad(True)
@@ -221,6 +359,10 @@ class Editor:
                 continue
             if not self.handle(key):
                 break
+            if self.build_requested:
+                self.build(screen)
+            if self.pr_lookup_requested:
+                self.find_prs(screen)
 
 
 def main():
