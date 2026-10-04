@@ -2,6 +2,9 @@
 
 A curses editor and build runner for `bluefin-build.yml`.
 
+For remote HTTP submission, persistent job logs, and Pushover completion
+notifications, see [the personal build server guide](SERVER.md).
+
 From the parent `ublue-os` directory, using its existing direnv environment:
 
 ```sh

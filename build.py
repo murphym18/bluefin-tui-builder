@@ -15,6 +15,7 @@ import sys
 import tempfile
 
 import yaml
+from notifications import notify
 
 from editor import BuildJob, load_job
 
@@ -138,18 +139,29 @@ def main():
     parser.add_argument("--repo", type=Path, help="local Bluefin repository (or BLUEFIN_REPO)")
     parser.add_argument("--build-dir", type=Path, help="retained checkout parent (or BLUEFIN_BUILD_DIR)")
     parser.add_argument("--dry-run", action="store_true", help="show builds and pushes without executing them")
+    parser.add_argument("--no-notify", action="store_true", help="disable completion notification")
     args = parser.parse_args()
+    outcome = "failed"
+    exit_code = 0
+    description = str(args.config)
     try:
         if not args.config.is_file():
             raise ValueError(f"configuration does not exist: {args.config}; save a job in the editor first")
-        build_and_push(load_job(args.config), repo=args.repo, build_parent=args.build_dir, dry_run=args.dry_run)
+        job = load_job(args.config)
+        description = f"{job.git_rev} (tag: {job.tag or 'stream names'})"
+        build_and_push(job, repo=args.repo, build_parent=args.build_dir, dry_run=args.dry_run)
+        outcome = "succeeded"
     except (OSError, ValueError, yaml.YAMLError, subprocess.CalledProcessError) as error:
         print(f"Error: {error}", file=sys.stderr)
-        return 1
+        exit_code = 1
     except KeyboardInterrupt:
         print("Build interrupted; any checkout is retained.", file=sys.stderr)
-        return 130
-    return 0
+        outcome = "interrupted"
+        exit_code = 130
+    if not args.dry_run and not args.no_notify:
+        delivery = notify(f"Build and push {outcome}: {description}")
+        print(f"Pushover: {delivery}", flush=True)
+    return exit_code
 
 
 if __name__ == "__main__":

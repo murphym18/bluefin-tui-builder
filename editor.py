@@ -80,7 +80,7 @@ def save_job(job, path):
 
 
 class Editor:
-    def __init__(self, job, path):
+    def __init__(self, job, path, server_url=None):
         self.job, self.path = job, path
         self.names = [f.name for f in fields(job)]
         self.active = 0
@@ -94,6 +94,8 @@ class Editor:
         self.pr_lookup_requested = False
         self.pr_choices = []
         self.pr_index = 0
+        self.server_url = server_url
+        self.submit_requested = False
 
     def toggle(self, name, index):
         self.choice[name] = index
@@ -130,9 +132,12 @@ class Editor:
         elif self.active == 1 and key == curses.KEY_F2:
             self.pr_lookup_requested = True
         elif key in (curses.KEY_DOWN, "\t"):
-            self.active = (self.active + 1) % 8
+            self.active = (self.active + 1) % (9 if self.server_url else 8)
         elif key in (curses.KEY_UP, curses.KEY_BTAB):
-            self.active = (self.active - 1) % 8
+            self.active = (self.active - 1) % (9 if self.server_url else 8)
+        elif self.active == 8 and self.server_url:
+            if key in ("\n", "\r", curses.KEY_ENTER, " "):
+                self.submit_requested = True
         elif self.active == 7:
             if key in ("\n", "\r", curses.KEY_ENTER, " "):
                 self.build_requested = True
@@ -260,6 +265,22 @@ class Editor:
                 pass
             screen.clearok(True)
 
+    def submit(self, screen):
+        from build import plan_job
+        from submit import submit_job
+
+        self.submit_requested = False
+        try:
+            plan_job(self.job)
+            save_job(self.job, self.path)
+            self.saved = asdict(self.job)
+            self.message = "Submitting job to build server..."
+            self.draw(screen)
+            result = submit_job(self.job, self.server_url)
+            self.message = f"Queued {result['id']}: {result['status_url']}"
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            self.message = f"Submission failed: {error}"
+
     def draw(self, screen):
         height, width = screen.getmaxyx()
         screen.erase()
@@ -271,7 +292,8 @@ class Editor:
             screen.refresh()
             return
         pad_width = max(width, 160)
-        pad = curses.newpad(19, pad_width)
+        pad_height = 21 if self.server_url else 19
+        pad = curses.newpad(pad_height, pad_width)
         dirty = " *" if asdict(self.job) != self.saved else ""
         pad.addstr(0, 0, "Bluefin build job" + dirty, curses.A_BOLD)
         selected_column = 0
@@ -306,11 +328,14 @@ class Editor:
         pad.addstr(14, 16, "[ Save bluefin-build.yml ]", curses.A_REVERSE if self.active == 6 else curses.A_BOLD)
         pad.addstr(16, 0, "> " if self.active == 7 else "  ")
         pad.addstr(16, 16, "[ Build and push ]", curses.A_REVERSE if self.active == 7 else curses.A_BOLD)
-        view_height = min(19, height - 3)
+        if self.server_url:
+            pad.addstr(18, 0, "> " if self.active == 8 else "  ")
+            pad.addstr(18, 16, "[ Submit to server ]", curses.A_REVERSE if self.active == 8 else curses.A_BOLD)
+        view_height = min(pad_height, height - 3)
         active_y = 2 + self.active * 2
         self.offset = min(self.offset, active_y)
         self.offset = max(self.offset, active_y - view_height + 1)
-        self.offset = min(self.offset, 19 - view_height)
+        self.offset = min(self.offset, pad_height - view_height)
         left = max(0, selected_column - width + 2)
         screen.noutrefresh()
         pad.noutrefresh(self.offset, left, 0, 0, view_height - 1, width - 1)
@@ -363,15 +388,19 @@ class Editor:
                 self.build(screen)
             if self.pr_lookup_requested:
                 self.find_prs(screen)
+            if self.submit_requested:
+                self.submit(screen)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.parse_args()
+    parser.add_argument("--server", default=os.environ.get("BLUEFIN_BUILD_SERVER"),
+                        help="HTTP build server URL; adds a remote submission button")
+    args = parser.parse_args()
     path = Path.cwd() / "bluefin-build.yml"
     try:
         job = load_job(path)
-        curses.wrapper(Editor(job, path).run)
+        curses.wrapper(Editor(job, path, server_url=args.server).run)
     except (OSError, ValueError, yaml.YAMLError, curses.error) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1
